@@ -2059,8 +2059,9 @@ impl ChatComposer {
 
     /// Leaves the cursor after one horizontal separator following a completion.
     ///
-    /// Line breaks are never reused as separators; a space is inserted before them so subsequent
-    /// typing stays on the completed token's line.
+    /// Another separator is preserved before ordinary suffix text so subsequent typing does not
+    /// merge into it. Line breaks are never reused as separators; a space is inserted before them
+    /// so subsequent typing stays on the completed token's line.
     fn advance_past_completion_separator(&mut self) {
         let cursor = self.draft.textarea.cursor();
         let existing_separator_len = self.draft.textarea.text()[cursor..]
@@ -2069,7 +2070,16 @@ impl ChatComposer {
             .filter(|c| Self::is_horizontal_whitespace(*c))
             .map(char::len_utf8);
         if let Some(separator_len) = existing_separator_len {
-            self.draft.textarea.set_cursor(cursor + separator_len);
+            let after_separator = cursor + separator_len;
+            let separator_precedes_plain_text = self.draft.textarea.text()[after_separator..]
+                .chars()
+                .next()
+                .is_some_and(|c| !c.is_whitespace() && !matches!(c, '@' | '$'));
+            if separator_precedes_plain_text {
+                self.draft.textarea.insert_str(" ");
+            } else {
+                self.draft.textarea.set_cursor(after_separator);
+            }
         } else {
             self.draft.textarea.insert_str(" ");
         }
@@ -2274,6 +2284,8 @@ impl ChatComposer {
     ///   second `@` in `@scope/pkg@latest`), keep treating the surrounding
     ///   whitespace-delimited token as the active token rather than starting a
     ///   new token at that nested prefix.
+    /// - For adjacent `$` skill mentions, a left-side mention fragment wins when
+    ///   the cursor is immediately before the next `$`.
     /// - If the token under the cursor starts with `prefix`, its byte range and
     ///   text without the leading prefix are returned. When `allow_empty` is
     ///   true, a lone prefix character yields `Some(String::new())` to surface hints.
@@ -2302,6 +2314,21 @@ impl ChatComposer {
         let before_cursor = &text[..safe_cursor];
         let after_cursor = &text[safe_cursor..];
         let prefix_len = prefix.len_utf8();
+
+        if prefix == '$' && allow_empty && after_cursor.starts_with(prefix) {
+            let left_fragment_start = before_cursor
+                .char_indices()
+                .rfind(|(_, c)| c.is_whitespace())
+                .map(|(idx, c)| idx + c.len_utf8())
+                .unwrap_or(0);
+            let left_fragment = &text[left_fragment_start..safe_cursor];
+            if left_fragment.starts_with(prefix) {
+                return Some((
+                    left_fragment_start..safe_cursor,
+                    left_fragment[prefix_len..].to_string(),
+                ));
+            }
+        }
 
         if allow_empty && after_cursor.starts_with(prefix) && before_cursor.ends_with(prefix) {
             let left_prefix_start = safe_cursor.saturating_sub(prefix_len);
@@ -6391,43 +6418,45 @@ mod tests {
 
     #[test]
     fn typing_skill_prefix_before_existing_skill_starts_new_mention() {
-        let (mut composer, _rx) = new_test_composer();
-        let rustdoc_path = test_path_buf("/tmp/rustdoc/SKILL.md").abs();
-        composer.set_skill_mentions(Some(vec![SkillMetadata {
-            name: "rustdoc".to_string(),
-            description: "Add focused RustDoc comments.".to_string(),
-            short_description: None,
-            interface: None,
-            dependencies: None,
-            policy: None,
-            path_to_skills_md: rustdoc_path.clone(),
-            scope: crate::test_support::skill_scope_user(),
-            plugin_id: None,
-        }]));
-        composer.set_text_content("$simplify-code".to_string(), Vec::new(), Vec::new());
-        composer.draft.textarea.set_cursor(0);
+        for inserted in ["$", "$r"] {
+            let (mut composer, _rx) = new_test_composer();
+            let rustdoc_path = test_path_buf("/tmp/rustdoc/SKILL.md").abs();
+            composer.set_skill_mentions(Some(vec![SkillMetadata {
+                name: "rustdoc".to_string(),
+                description: "Add focused RustDoc comments.".to_string(),
+                short_description: None,
+                interface: None,
+                dependencies: None,
+                policy: None,
+                path_to_skills_md: rustdoc_path.clone(),
+                scope: crate::test_support::skill_scope_user(),
+                plugin_id: None,
+            }]));
+            composer.set_text_content("$simplify-code".to_string(), Vec::new(), Vec::new());
+            composer.draft.textarea.set_cursor(0);
 
-        composer.insert_str("$");
+            composer.insert_str(inserted);
 
-        let ActivePopup::Skill(popup) = &composer.popups.active else {
-            panic!("expected skill popup for new empty mention");
-        };
-        let mention = popup
-            .selected_mention()
-            .expect("expected skill mention to be selected");
-        assert_eq!(mention.insert_text, "$rustdoc".to_string());
+            let ActivePopup::Skill(popup) = &composer.popups.active else {
+                panic!("expected skill popup for new mention fragment {inserted:?}");
+            };
+            let mention = popup
+                .selected_mention()
+                .expect("expected skill mention to be selected");
+            assert_eq!(mention.insert_text, "$rustdoc".to_string());
 
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert_eq!(composer.current_text(), "$rustdoc $simplify-code");
-        assert_eq!(
-            composer.mention_bindings(),
-            vec![MentionBinding {
-                sigil: '$',
-                mention: "rustdoc".to_string(),
-                path: rustdoc_path.display().to_string(),
-            }]
-        );
+            assert_eq!(composer.current_text(), "$rustdoc $simplify-code");
+            assert_eq!(
+                composer.mention_bindings(),
+                vec![MentionBinding {
+                    sigil: '$',
+                    mention: "rustdoc".to_string(),
+                    path: rustdoc_path.display().to_string(),
+                }]
+            );
+        }
     }
 
     #[test]
@@ -6889,14 +6918,21 @@ mod tests {
 
     #[test]
     fn current_prefixed_token_prefers_lone_prefix_before_adjacent_token() {
-        let mut textarea = TextArea::new();
-        textarea.insert_str("$$simplify-code");
-        textarea.set_cursor("$".len());
+        for (text, cursor, expected_query) in [
+            ("$$simplify-code", "$".len(), ""),
+            ("$r$simplify-code", "$r".len(), "r"),
+        ] {
+            let mut textarea = TextArea::new();
+            textarea.insert_str(text);
+            textarea.set_cursor(cursor);
 
-        assert_eq!(
-            ChatComposer::current_prefixed_token_range(&textarea, '$', /*allow_empty*/ true),
-            Some((0.."$".len(), String::new()))
-        );
+            assert_eq!(
+                ChatComposer::current_prefixed_token_range(
+                    &textarea, '$', /*allow_empty*/ true
+                ),
+                Some((0..cursor, expected_query.to_string()))
+            );
+        }
     }
 
     #[test]
@@ -9309,6 +9345,21 @@ mod tests {
             &mut composer,
             "@ma  next",
             /*cursor*/ "@ma ".len(),
+            "ma",
+            PathBuf::from("src/main.rs"),
+        );
+        composer.insert_str("foo");
+
+        assert_eq!(composer.current_text(), "src/main.rs foo next");
+    }
+
+    #[test]
+    fn file_completion_preserves_separator_before_existing_suffix() {
+        let (mut composer, _rx) = new_test_composer();
+        complete_file(
+            &mut composer,
+            "@ma next",
+            /*cursor*/ "@ma".len(),
             "ma",
             PathBuf::from("src/main.rs"),
         );
