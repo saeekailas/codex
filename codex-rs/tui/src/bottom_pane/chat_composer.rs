@@ -2044,13 +2044,21 @@ impl ChatComposer {
             || lower.ends_with(".webp")
     }
 
+    fn is_horizontal_whitespace(c: char) -> bool {
+        c.is_whitespace()
+            && !matches!(
+                c,
+                '\n' | '\r' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+            )
+    }
+
     /// Ensure a completion is followed by whitespace and leave the cursor after that separator.
     fn advance_past_completion_separator(&mut self) {
         let cursor = self.draft.textarea.cursor();
         let existing_separator_len = self.draft.textarea.text()[cursor..]
             .chars()
             .next()
-            .filter(|c| c.is_whitespace())
+            .filter(|c| Self::is_horizontal_whitespace(*c))
             .map(char::len_utf8);
         if let Some(separator_len) = existing_separator_len {
             self.draft.textarea.set_cursor(cursor + separator_len);
@@ -2263,9 +2271,11 @@ impl ChatComposer {
         };
 
         // Left candidate: token containing the cursor position. When the cursor is on separator
-        // whitespace, use the token immediately to the left of the entire whitespace run.
+        // whitespace, use the token immediately to the left of the same-line whitespace run.
         let end_left = if at_whitespace {
-            before_cursor.trim_end_matches(char::is_whitespace).len()
+            before_cursor
+                .trim_end_matches(Self::is_horizontal_whitespace)
+                .len()
         } else {
             let end_left_rel = after_cursor
                 .char_indices()
@@ -2285,10 +2295,10 @@ impl ChatComposer {
             None
         };
 
-        // Right candidate: token immediately after any whitespace from the cursor.
+        // Right candidate: token immediately after any same-line whitespace from the cursor.
         let ws_len_right: usize = after_cursor
             .chars()
-            .take_while(|c| c.is_whitespace())
+            .take_while(|c| Self::is_horizontal_whitespace(*c))
             .map(char::len_utf8)
             .sum();
         let start_right = safe_cursor + ws_len_right;
@@ -6714,6 +6724,25 @@ mod tests {
     }
 
     #[test]
+    fn current_prefixed_token_affinity_does_not_cross_line_break() {
+        for (text, prefix, allow_empty) in [
+            ("@file\n  continue", '@', false),
+            ("continue  \n@file", '@', false),
+            ("$skill\n  continue", '$', true),
+            ("continue  \n$skill", '$', true),
+        ] {
+            let mut textarea = TextArea::new();
+            textarea.insert_str(text);
+            textarea.set_cursor(text.find("  ").expect("indentation present") + 1);
+
+            assert_eq!(
+                ChatComposer::current_prefixed_token_range(&textarea, prefix, allow_empty),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn test_current_at_token_tracks_tokens_with_second_at() {
         let input = "npx -y @kaeawc/auto-mobile@latest";
         let token_start = input.find("@kaeawc").expect("scoped npm package present");
@@ -9117,6 +9146,37 @@ mod tests {
         composer.insert_str("foo");
 
         assert_eq!(composer.current_text(), "src/main.rs foo next");
+    }
+
+    #[test]
+    fn file_completion_inserts_separator_before_line_break() {
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            /*has_input_focus*/ true,
+            sender,
+            /*enhanced_keys_supported*/ false,
+            "Ask Codex to do anything".to_string(),
+            /*disable_paste_burst*/ false,
+        );
+        composer.set_text_content("@ma\nnext".to_string(), Vec::new(), Vec::new());
+        composer.draft.textarea.set_cursor("@ma".len());
+        composer.sync_popups();
+        composer.on_file_search_result(
+            "ma".to_string(),
+            vec![FileMatch {
+                score: 1,
+                path: PathBuf::from("src/main.rs"),
+                match_type: codex_file_search::MatchType::File,
+                root: PathBuf::from("/tmp"),
+                indices: None,
+            }],
+        );
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        composer.insert_str("foo");
+
+        assert_eq!(composer.current_text(), "src/main.rs foo\nnext");
     }
 
     #[test]
