@@ -7,6 +7,7 @@ use crate::bottom_pane::mentions_v2::MentionV2Popup;
 use crate::bottom_pane::skill_popup::SkillPopup;
 use std::ops::Range;
 
+/// One token occurrence whose autocomplete popup should remain hidden.
 pub(super) struct DismissedToken {
     range: Range<usize>,
     query: String,

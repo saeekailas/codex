@@ -2057,7 +2057,10 @@ impl ChatComposer {
             )
     }
 
-    /// Ensure a completion is followed by whitespace and leave the cursor after that separator.
+    /// Leaves the cursor after one horizontal separator following a completion.
+    ///
+    /// Line breaks are never reused as separators; a space is inserted before them so subsequent
+    /// typing stays on the completed token's line.
     fn advance_past_completion_separator(&mut self) {
         let cursor = self.draft.textarea.cursor();
         let existing_separator_len = self.draft.textarea.text()[cursor..]
@@ -2072,6 +2075,10 @@ impl ChatComposer {
         }
     }
 
+    /// Dismisses popup synchronization only for the exact token occurrence just inserted.
+    ///
+    /// Matching both range and text prevents an identical token later in the draft from inheriting
+    /// the completed token's dismissal state.
     fn dismiss_completed_prefixed_token(
         &mut self,
         prefix: char,
@@ -2294,6 +2301,18 @@ impl ChatComposer {
         // Split the line around the (now safe) cursor position.
         let before_cursor = &text[..safe_cursor];
         let after_cursor = &text[safe_cursor..];
+        let prefix_len = prefix.len_utf8();
+
+        if allow_empty && after_cursor.starts_with(prefix) && before_cursor.ends_with(prefix) {
+            let left_prefix_start = safe_cursor.saturating_sub(prefix_len);
+            let left_prefix_starts_token = text[..left_prefix_start]
+                .chars()
+                .next_back()
+                .is_none_or(char::is_whitespace);
+            if left_prefix_starts_token {
+                return Some((left_prefix_start..safe_cursor, String::new()));
+            }
+        }
 
         // Detect whether we're on whitespace at the cursor boundary.
         let at_whitespace = if safe_cursor < text.len() {
@@ -2354,10 +2373,9 @@ impl ChatComposer {
         let left_match = token_left.filter(|t| t.starts_with(prefix));
         let right_match = token_right.filter(|t| t.starts_with(prefix));
 
-        let left_prefixed =
-            left_match.map(|t| (start_left..end_left, t[prefix.len_utf8()..].to_string()));
+        let left_prefixed = left_match.map(|t| (start_left..end_left, t[prefix_len..].to_string()));
         let right_prefixed =
-            right_match.map(|t| (start_right..end_right, t[prefix.len_utf8()..].to_string()));
+            right_match.map(|t| (start_right..end_right, t[prefix_len..].to_string()));
 
         if at_whitespace {
             if token_left.is_some_and(|t| t == prefix_str) && !allow_empty {
@@ -2394,6 +2412,10 @@ impl ChatComposer {
         Self::current_prefixed_token(textarea, '@', /*allow_empty*/ false)
     }
 
+    /// Returns the active prefixed token only when its sigil and name remain editable plaintext.
+    ///
+    /// Atomic elements and tokens whose mention prefix is already atomic are excluded so bound
+    /// mentions are not offered for completion again.
     fn current_editable_prefixed_token_range(
         &self,
         prefix: char,
@@ -4503,7 +4525,23 @@ mod tests {
     use crate::bottom_pane::chat_composer::LARGE_PASTE_CHAR_THRESHOLD;
     use crate::bottom_pane::textarea::TextArea;
     use codex_protocol::models::local_image_label_text;
+    use tokio::sync::mpsc::UnboundedReceiver;
     use tokio::sync::mpsc::unbounded_channel;
+
+    fn new_test_composer() -> (ChatComposer, UnboundedReceiver<AppEvent>) {
+        let (tx, rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        (
+            ChatComposer::new(
+                /*has_input_focus*/ true,
+                sender,
+                /*enhanced_keys_supported*/ false,
+                "Ask Codex to do anything".to_string(),
+                /*disable_paste_burst*/ false,
+            ),
+            rx,
+        )
+    }
 
     #[test]
     fn footer_hint_row_is_separated_from_composer() {
@@ -6282,15 +6320,7 @@ mod tests {
 
     #[test]
     fn skill_popup_targets_unbound_mention_left_of_bound_mention() {
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
+        let (mut composer, _rx) = new_test_composer();
         configure_partially_bound_skill_mentions(&mut composer);
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -6323,15 +6353,7 @@ mod tests {
 
     #[test]
     fn skill_completion_advances_past_existing_separator() {
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
+        let (mut composer, _rx) = new_test_composer();
         configure_partially_bound_skill_mentions(&mut composer);
 
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -6345,15 +6367,7 @@ mod tests {
 
     #[test]
     fn skill_completion_does_not_dismiss_identical_next_mention() {
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
+        let (mut composer, _rx) = new_test_composer();
         composer.set_skill_mentions(Some(vec![SkillMetadata {
             name: "skill".to_string(),
             description: "Example skill used in tests.".to_string(),
@@ -6373,6 +6387,47 @@ mod tests {
 
         assert_eq!(composer.draft.textarea.cursor(), "$skill ".len());
         assert!(matches!(composer.popups.active, ActivePopup::Skill(_)));
+    }
+
+    #[test]
+    fn typing_skill_prefix_before_existing_skill_starts_new_mention() {
+        let (mut composer, _rx) = new_test_composer();
+        let rustdoc_path = test_path_buf("/tmp/rustdoc/SKILL.md").abs();
+        composer.set_skill_mentions(Some(vec![SkillMetadata {
+            name: "rustdoc".to_string(),
+            description: "Add focused RustDoc comments.".to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            policy: None,
+            path_to_skills_md: rustdoc_path.clone(),
+            scope: crate::test_support::skill_scope_user(),
+            plugin_id: None,
+        }]));
+        composer.set_text_content("$simplify-code".to_string(), Vec::new(), Vec::new());
+        composer.draft.textarea.set_cursor(0);
+
+        composer.insert_str("$");
+
+        let ActivePopup::Skill(popup) = &composer.popups.active else {
+            panic!("expected skill popup for new empty mention");
+        };
+        let mention = popup
+            .selected_mention()
+            .expect("expected skill mention to be selected");
+        assert_eq!(mention.insert_text, "$rustdoc".to_string());
+
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(composer.current_text(), "$rustdoc $simplify-code");
+        assert_eq!(
+            composer.mention_bindings(),
+            vec![MentionBinding {
+                sigil: '$',
+                mention: "rustdoc".to_string(),
+                path: rustdoc_path.display().to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -6830,6 +6885,18 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn current_prefixed_token_prefers_lone_prefix_before_adjacent_token() {
+        let mut textarea = TextArea::new();
+        textarea.insert_str("$$simplify-code");
+        textarea.set_cursor("$".len());
+
+        assert_eq!(
+            ChatComposer::current_prefixed_token_range(&textarea, '$', /*allow_empty*/ true),
+            Some((0.."$".len(), String::new()))
+        );
     }
 
     #[test]
@@ -9207,32 +9274,44 @@ mod tests {
         }
     }
 
-    #[test]
-    fn file_completion_advances_past_existing_separator() {
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
-        composer.set_text_content("@ma  next".to_string(), Vec::new(), Vec::new());
-        composer.draft.textarea.set_cursor("@ma ".len());
+    fn complete_file(
+        composer: &mut ChatComposer,
+        text: &str,
+        cursor: usize,
+        query: &str,
+        selected_path: PathBuf,
+    ) {
+        composer.set_text_content(text.to_string(), Vec::new(), Vec::new());
+        composer.draft.textarea.set_cursor(cursor);
         composer.sync_popups();
+        let root = selected_path
+            .parent()
+            .filter(|_| selected_path.is_absolute())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
         composer.on_file_search_result(
-            "ma".to_string(),
+            query.to_string(),
             vec![FileMatch {
                 score: 1,
-                path: PathBuf::from("src/main.rs"),
+                path: selected_path,
                 match_type: codex_file_search::MatchType::File,
-                root: PathBuf::from("/tmp"),
+                root,
                 indices: None,
             }],
         );
-
         let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn file_completion_advances_past_existing_separator() {
+        let (mut composer, _rx) = new_test_composer();
+        complete_file(
+            &mut composer,
+            "@ma  next",
+            /*cursor*/ "@ma ".len(),
+            "ma",
+            PathBuf::from("src/main.rs"),
+        );
         composer.insert_str("foo");
 
         assert_eq!(composer.current_text(), "src/main.rs foo next");
@@ -9240,30 +9319,14 @@ mod tests {
 
     #[test]
     fn file_completion_inserts_separator_before_line_break() {
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
+        let (mut composer, _rx) = new_test_composer();
+        complete_file(
+            &mut composer,
+            "@ma\nnext",
+            /*cursor*/ "@ma".len(),
+            "ma",
+            PathBuf::from("src/main.rs"),
         );
-        composer.set_text_content("@ma\nnext".to_string(), Vec::new(), Vec::new());
-        composer.draft.textarea.set_cursor("@ma".len());
-        composer.sync_popups();
-        composer.on_file_search_result(
-            "ma".to_string(),
-            vec![FileMatch {
-                score: 1,
-                path: PathBuf::from("src/main.rs"),
-                match_type: codex_file_search::MatchType::File,
-                root: PathBuf::from("/tmp"),
-                indices: None,
-            }],
-        );
-
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         composer.insert_str("foo");
 
         assert_eq!(composer.current_text(), "src/main.rs foo\nnext");
@@ -9271,30 +9334,14 @@ mod tests {
 
     #[test]
     fn file_completion_for_sigil_path_does_not_reopen_popup() {
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
+        let (mut composer, _rx) = new_test_composer();
+        complete_file(
+            &mut composer,
+            "@ma\nnext",
+            /*cursor*/ "@ma".len(),
+            "ma",
+            PathBuf::from("@scope/main.rs"),
         );
-        composer.set_text_content("@ma\nnext".to_string(), Vec::new(), Vec::new());
-        composer.draft.textarea.set_cursor("@ma".len());
-        composer.sync_popups();
-        composer.on_file_search_result(
-            "ma".to_string(),
-            vec![FileMatch {
-                score: 1,
-                path: PathBuf::from("@scope/main.rs"),
-                match_type: codex_file_search::MatchType::File,
-                root: PathBuf::from("/tmp"),
-                indices: None,
-            }],
-        );
-
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
         assert_eq!(composer.current_text(), "@scope/main.rs \nnext");
         assert!(matches!(composer.popups.active, ActivePopup::None));
@@ -9310,30 +9357,14 @@ mod tests {
 
     #[test]
     fn file_completion_does_not_dismiss_identical_next_token() {
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
+        let (mut composer, _rx) = new_test_composer();
+        complete_file(
+            &mut composer,
+            "@ma  @scope/main.rs",
+            /*cursor*/ "@ma".len(),
+            "ma",
+            PathBuf::from("@scope/main.rs"),
         );
-        composer.set_text_content("@ma  @scope/main.rs".to_string(), Vec::new(), Vec::new());
-        composer.draft.textarea.set_cursor("@ma".len());
-        composer.sync_popups();
-        composer.on_file_search_result(
-            "ma".to_string(),
-            vec![FileMatch {
-                score: 1,
-                path: PathBuf::from("@scope/main.rs"),
-                match_type: codex_file_search::MatchType::File,
-                root: PathBuf::from("/tmp"),
-                indices: None,
-            }],
-        );
-
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         composer.draft.textarea.set_cursor("@scope/main.rs  ".len());
         composer.sync_popups();
 
@@ -9348,30 +9379,14 @@ mod tests {
             ImageBuffer::from_fn(3, 2, |_x, _y| Rgba([1, 2, 3, 255]));
         image.save(&image_path).expect("write temp png");
 
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
+        let (mut composer, _rx) = new_test_composer();
+        complete_file(
+            &mut composer,
+            "@image  next",
+            /*cursor*/ "@image ".len(),
+            "image",
+            image_path.clone(),
         );
-        composer.set_text_content("@image  next".to_string(), Vec::new(), Vec::new());
-        composer.draft.textarea.set_cursor("@image ".len());
-        composer.sync_popups();
-        composer.on_file_search_result(
-            "image".to_string(),
-            vec![FileMatch {
-                score: 1,
-                path: image_path.clone(),
-                match_type: codex_file_search::MatchType::File,
-                root: tmp.path().to_path_buf(),
-                indices: None,
-            }],
-        );
-
-        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         composer.insert_str("foo");
 
         assert_eq!(composer.current_text(), "[Image #1] foo next");
