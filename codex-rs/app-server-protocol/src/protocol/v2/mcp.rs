@@ -329,6 +329,9 @@ pub struct McpElicitationSchema {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub required: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub title: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
